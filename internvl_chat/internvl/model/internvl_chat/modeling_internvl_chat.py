@@ -4,9 +4,9 @@
 # Licensed under The MIT License [see LICENSE for details]
 # --------------------------------------------------------
 import warnings
-from typing import Any, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
-import torch.distributed as dist
+import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers
 from internvl.conversation import get_conv_template
@@ -15,11 +15,11 @@ from internvl.model.phi3.modeling_phi3 import Phi3ForCausalLM
 from peft import LoraConfig, get_peft_model
 from torch import nn
 from torch.nn import CrossEntropyLoss
-from transformers import (AutoModel, GenerationConfig, LlamaForCausalLM,
-                          LlamaTokenizer, Qwen2ForCausalLM)
+from transformers import (GenerationConfig, LlamaForCausalLM,
+                          Qwen2ForCausalLM)
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
-from transformers.utils import ModelOutput, logging
+from transformers.utils import logging
 
 from .configuration_internvl_chat import InternVLChatConfig
 from .modeling_intern_vit import InternVisionModel
@@ -156,7 +156,8 @@ class InternVLChatModel(PreTrainedModel):
         input_embeds = input_embeds.reshape(B * N, C)
 
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
-            print(f'dynamic ViT batch size: {vit_batch_size}, images per sample: {vit_batch_size / B}, dynamic token length: {N}')
+            print(
+                f'dynamic ViT batch size: {vit_batch_size}, images per sample: {vit_batch_size / B}, dynamic token length: {N}')
 
         input_ids = input_ids.reshape(B * N)
         selected = (input_ids == self.img_context_token_id)
@@ -298,7 +299,7 @@ class InternVLChatModel(PreTrainedModel):
 
     def chat(self, tokenizer, pixel_values, question, generation_config, history=None, return_history=False,
              num_patches_list=None, IMG_START_TOKEN='<img>', IMG_END_TOKEN='</img>', IMG_CONTEXT_TOKEN='<IMG_CONTEXT>',
-             verbose=False):
+             verbose=False, return_max_dict=True):
 
         if history is None and pixel_values is not None and '<image>' not in question:
             question = '<image>\n' + question
@@ -334,23 +335,39 @@ class InternVLChatModel(PreTrainedModel):
         input_ids = model_inputs['input_ids'].cuda()
         attention_mask = model_inputs['attention_mask'].cuda()
         generation_config['eos_token_id'] = eos_token_id
-        generation_output = self.generate(
+        generation_output, logits = self.generate(
             pixel_values=pixel_values,
             input_ids=input_ids,
             attention_mask=attention_mask,
             **generation_config
         )
+
         response = tokenizer.batch_decode(generation_output, skip_special_tokens=True)[0]
         response = response.split(template.sep)[0].strip()
         history.append((question, response))
-        if return_history:
-            return response, history
+
+        # Compute confidence scores
+        probs = [F.softmax(logit, dim=-1) for logit in logits]
+        confidence_scores = [prob.max().item() for prob in probs]
+
+        if return_max_dict:
+            if return_history:
+                return {"response": response, "history": history, "score": max(confidence_scores)}
+            else:
+                query_to_print = query.replace(IMG_CONTEXT_TOKEN, '')
+                query_to_print = query_to_print.replace(f'{IMG_START_TOKEN}{IMG_END_TOKEN}', '<image>')
+                if verbose:
+                    print(query_to_print, response)
+                return {"response": response, "score": max(confidence_scores)}
         else:
-            query_to_print = query.replace(IMG_CONTEXT_TOKEN, '')
-            query_to_print = query_to_print.replace(f'{IMG_START_TOKEN}{IMG_END_TOKEN}', '<image>')
-            if verbose:
-                print(query_to_print, response)
-            return response
+            if return_history:
+                return {"response": response, "history": history, "score": max(confidence_scores)}
+            else:
+                query_to_print = query.replace(IMG_CONTEXT_TOKEN, '')
+                query_to_print = query_to_print.replace(f'{IMG_START_TOKEN}{IMG_END_TOKEN}', '<image>')
+                if verbose:
+                    print(query_to_print, response)
+                return {"response": response, "score": min(confidence_scores)}
 
     @torch.no_grad()
     def generate(
@@ -392,6 +409,10 @@ class InternVLChatModel(PreTrainedModel):
             return_dict=return_dict,
             use_cache=True,
             **generate_kwargs,
+            output_scores=True,
+            return_dict_in_generate=True
         )
 
-        return outputs
+        # return outputs
+        score_gen = outputs.scores
+        return outputs.sequences, score_gen
