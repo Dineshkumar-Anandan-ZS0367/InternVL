@@ -299,7 +299,7 @@ class InternVLChatModel(PreTrainedModel):
 
     def chat(self, tokenizer, pixel_values, question, generation_config, history=None, return_history=False,
              num_patches_list=None, IMG_START_TOKEN='<img>', IMG_END_TOKEN='</img>', IMG_CONTEXT_TOKEN='<IMG_CONTEXT>',
-             verbose=False, return_max_dict=True):
+             verbose=False):
 
         if history is None and pixel_values is not None and '<image>' not in question:
             question = '<image>\n' + question
@@ -350,24 +350,14 @@ class InternVLChatModel(PreTrainedModel):
         probs = [F.softmax(logit, dim=-1) for logit in logits]
         confidence_scores = [prob.max().item() for prob in probs]
 
-        if return_max_dict:
-            if return_history:
-                return {"response": response, "history": history, "score": max(confidence_scores)}
-            else:
-                query_to_print = query.replace(IMG_CONTEXT_TOKEN, '')
-                query_to_print = query_to_print.replace(f'{IMG_START_TOKEN}{IMG_END_TOKEN}', '<image>')
-                if verbose:
-                    print(query_to_print, response)
-                return {"response": response, "score": max(confidence_scores)}
+        if return_history:
+            return {"response": response, "history": history,
+                    "scores": {"minScore": min(confidence_scores), "maxScore": max(confidence_scores),
+                               "avgScore": (sum(confidence_scores) / len(confidence_scores))}}
         else:
-            if return_history:
-                return {"response": response, "history": history, "score": max(confidence_scores)}
-            else:
-                query_to_print = query.replace(IMG_CONTEXT_TOKEN, '')
-                query_to_print = query_to_print.replace(f'{IMG_START_TOKEN}{IMG_END_TOKEN}', '<image>')
-                if verbose:
-                    print(query_to_print, response)
-                return {"response": response, "score": min(confidence_scores)}
+            return {"response": response,
+                    "scores": {"minScore": min(confidence_scores), "maxScore": max(confidence_scores),
+                               "avgScore": (sum(confidence_scores) / len(confidence_scores))}}
 
     @torch.no_grad()
     def generate(
@@ -412,7 +402,6 @@ class InternVLChatModel(PreTrainedModel):
             output_scores=True,
             return_dict_in_generate=True
         )
-
         # return outputs
         score_gen = outputs.scores
         return outputs.sequences, score_gen
